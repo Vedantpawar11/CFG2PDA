@@ -10,6 +10,7 @@ from main import (
     validate_grammar,
     build_pda,
     simulate,
+    validate_api_request,
 )
 
 
@@ -101,3 +102,23 @@ def test_epsilon_alias_input_and_wrong_branch_trace():
         if index:
             assert row["transition"] is not None
             assert row["transition"]["to_state"] == row["state"]
+
+
+def test_api_validator_separates_syntax_from_structure():
+    valid_json = '{"order":{"items":[{"product":"Laptop","quantity":1}]}}'
+    syntax_only = validate_api_request(valid_json, check_structure=False)
+    assert syntax_only["syntax"]["status"] == "valid_json"
+    assert syntax_only["structure"] is None
+    assert validate_api_request(valid_json)["structure"]["status"] == "accepted"
+    assert validate_api_request('{"order":')["syntax"]["status"] == "invalid_json"
+    assert validate_api_request('{"order":{"items":[{"product":"Laptop"}]}}')["structure"]["status"] == "rejected"
+
+
+def test_common_ascii_grammar_forms_and_limits():
+    grammar_value = Grammar(
+        variables=["S"], terminals=["a", "b"],
+        productions=parse_productions("S -> a S b | epsilon"), start_symbol="S"
+    )
+    assert simulate(build_pda(grammar_value), "aabb")["status"] == "accepted"
+    limited = simulate(build_pda(grammar_value), "aabb", max_steps=1)
+    assert limited["status"] == "limit_reached"

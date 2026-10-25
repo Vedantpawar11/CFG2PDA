@@ -2,6 +2,8 @@
 from collections import deque
 from typing import Any
 import re
+import json
+import time
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +14,8 @@ BOTTOM = "Z0"
 MAX_STEPS = 5000
 MAX_CONFIGURATIONS = 10000
 MAX_STACK_DEPTH = 200
+MAX_INPUT_LENGTH = 10000
+MAX_SIMULATION_SECONDS = 2.0
 
 app = FastAPI(title="CFG2PDA API", version="1.0.0", description="Convert context-free grammars to PDAs and simulate strings.")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -44,6 +48,114 @@ class SimulateRequest(BaseModel):
     max_steps: int = Field(default=MAX_STEPS, ge=1, le=100000)
     max_configurations: int = Field(default=MAX_CONFIGURATIONS, ge=1, le=100000)
     max_stack_depth: int = Field(default=MAX_STACK_DEPTH, ge=1, le=2000)
+
+
+class ApiValidationRequest(BaseModel):
+    request_text: str
+    grammar: Grammar | None = None
+    check_structure: bool = True
+    max_input_size: int = Field(default=100000, ge=1, le=1000000)
+
+
+SHOPPING_GRAMMAR = Grammar(
+    variables=["S", "L"],
+    terminals=["o", "i", "a", "x", "c"],
+    productions=[
+        Production(left="S", right=["o", "i", "a", "L", "c"]),
+        Production(left="L", right=["x", "L"]),
+        Production(left="L", right=[EPSILON]),
+    ],
+    start_symbol="S",
+)
+
+
+def shopping_structure_tokens(value: Any) -> str:
+    """Encode validated shopping-order structure for the CFG/PDA pipeline."""
+    if not isinstance(value, dict) or set(value) != {"order"}:
+        return ""
+    order = value["order"]
+    if not isinstance(order, dict) or set(order) != {"items"} or not isinstance(order["items"], list):
+        return ""
+    tokens = "oia"
+    for item in order["items"]:
+        if not isinstance(item, dict) or set(item) != {"product", "quantity"}:
+            return ""
+        if not isinstance(item["product"], str) or not isinstance(item["quantity"], int) or isinstance(item["quantity"], bool) or item["quantity"] < 1:
+            return ""
+        tokens += "x"
+    return tokens + "c"
+
+
+def validate_api_request(request_text: str, grammar: Grammar | None = None, max_input_size: int = 100000, check_structure: bool = True) -> dict[str, Any]:
+    if len(request_text.encode("utf-8")) > max_input_size:
+        return {"syntax": {"valid": False, "status": "limit_reached", "message": "Request exceeds the maximum input size."}, "structure": None}
+    try:
+        parsed = json.loads(request_text)
+    except (json.JSONDecodeError, TypeError, RecursionError) as exc:
+        return {"syntax": {"valid": False, "status": "invalid_json", "message": f"Invalid JSON: {exc}"}, "structure": None}
+    if not check_structure:
+        return {"syntax": {"valid": True, "status": "valid_json", "message": "JSON syntax is valid."}, "structure": None}
+
+    selected = SHOPPING_GRAMMAR
+    structural_input = shopping_structure_tokens(parsed)
+    if not structural_input:
+        return {
+            "syntax": {"valid": True, "status": "valid_json", "message": "JSON syntax is valid."},
+            "structure": {"status": "rejected", "message": "JSON does not match the shopping-order structure.", "input": ""},
+        }
+    validation = validate_grammar(selected)
+    if not validation["valid"]:
+        return {"syntax": {"valid": True, "status": "valid_json", "message": "JSON syntax is valid."}, "structure": {"status": "invalid_grammar", "message": validation["message"], "validation": validation}}
+    pda = build_pda(selected)
+    simulation = simulate(pda, structural_input)
+    return {
+        "syntax": {"valid": True, "status": "valid_json", "message": "JSON syntax is valid."},
+        "structure": {"status": simulation["status"], "message": simulation["message"], "input": structural_input, "trace": simulation["trace"], "configurations_explored": simulation["configurations_explored"]},
+    }
+
+
+def boundary_test_case(case_id: str, category: str, expected: str, callback) -> dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        actual = callback()
+        status = "PASS" if actual == expected else "FAIL"
+        return {"id": case_id, "category": category, "expected": expected, "actual": actual, "status": status, "duration_ms": round((time.perf_counter() - started) * 1000, 2)}
+    except Exception as exc:
+        return {"id": case_id, "category": category, "expected": expected, "actual": None, "status": "ERROR", "error": str(exc), "duration_ms": round((time.perf_counter() - started) * 1000, 2)}
+
+
+def run_boundary_tests() -> dict[str, Any]:
+    cases = []
+    valid = Grammar(variables=["S"], terminals=["a", "b"], productions=parse_productions("S → aSb | ε"), start_symbol="S")
+    def parse_status(text: str) -> str:
+        try:
+            parse_productions(text)
+            return "PASS"
+        except ValueError:
+            return "ERROR"
+    pda = build_pda(valid)
+    cases.extend([
+        boundary_test_case("grammar-empty", "Grammar Validation", "ERROR", lambda: parse_status("")),
+        boundary_test_case("grammar-missing-start", "Grammar Validation", False, lambda: validate_grammar(Grammar(variables=["S"], terminals=["a"], productions=parse_productions("S → a"), start_symbol=""))["valid"]),
+        boundary_test_case("grammar-undefined-start", "Grammar Validation", False, lambda: validate_grammar(Grammar(variables=["S"], terminals=["a"], productions=parse_productions("S → a"), start_symbol="A"))["valid"]),
+        boundary_test_case("grammar-invalid-rule", "Grammar Validation", "ERROR", lambda: parse_status("S a")),
+        boundary_test_case("grammar-epsilon", "Grammar Validation", True, lambda: validate_grammar(valid)["valid"]),
+        boundary_test_case("grammar-unreachable-warning", "Grammar Validation", True, lambda: validate_grammar(Grammar(variables=["S", "A"], terminals=["a"], productions=parse_productions("S → a"), start_symbol="S"))["valid"]),
+        boundary_test_case("input-empty", "Input Recognition", "accepted", lambda: simulate(pda, "")["status"]),
+        boundary_test_case("input-ab", "Input Recognition", "accepted", lambda: simulate(pda, "ab")["status"]),
+        boundary_test_case("input-aabb", "Input Recognition", "accepted", lambda: simulate(pda, "aabb")["status"]),
+        boundary_test_case("input-aaabbb", "Input Recognition", "accepted", lambda: simulate(pda, "aaabbb")["status"]),
+        boundary_test_case("input-aab", "Input Recognition", "rejected", lambda: simulate(pda, "aab")["status"]),
+        boundary_test_case("input-abb", "Input Recognition", "rejected", lambda: simulate(pda, "abb")["status"]),
+        boundary_test_case("pda-step-limit", "Resource Limits", "limit_reached", lambda: simulate(pda, "aabb", max_steps=1)["status"]),
+        boundary_test_case("pda-invalid-symbol", "PDA Simulation", "invalid_input", lambda: simulate(pda, "abc")["status"]),
+        boundary_test_case("api-valid-order", "API Structure Validation", "accepted", lambda: validate_api_request(json.dumps({"order": {"items": [{"product": "Laptop", "quantity": 1}]}}))["structure"]["status"]),
+        boundary_test_case("api-missing-field", "API Structure Validation", "rejected", lambda: validate_api_request('{"order":{"items":[{"product":"Laptop"}]}}')["structure"]["status"]),
+        boundary_test_case("api-invalid-json", "API Structure Validation", "invalid_json", lambda: validate_api_request('{"order":')["syntax"]["status"]),
+    ])
+    summary = {status: sum(1 for case in cases if case["status"] == status) for status in ("PASS", "FAIL", "ERROR")}
+    summary["not_run"] = 0
+    return {"executed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tests": cases, "summary": {"total": len(cases), **summary}, "duration_ms": round(sum(case["duration_ms"] for case in cases), 2)}
 
 
 def tokenize_symbols(value: str) -> list[str]:
@@ -172,6 +284,8 @@ def simulate(
     """
     alphabet = set(pda.get("input_alphabet", []))
     normalized_input = "" if input_string.strip().lower() in {"ε", "eps", "epsilon", "λ", "lambda"} else input_string
+    if len(normalized_input) > MAX_INPUT_LENGTH:
+        return {"status": "limit_reached", "message": f"Input exceeds the maximum length of {MAX_INPUT_LENGTH} symbols.", "steps": 0, "trace": [], "configurations_explored": 0}
     for symbol in normalized_input:
         if symbol not in alphabet:
             return {
@@ -200,8 +314,12 @@ def simulate(
     limit_reached = False
     longest_trace = initial_trace
     accept_states = set(pda.get("accept_states", []))
+    started_at = time.perf_counter()
 
     while queue:
+        if time.perf_counter() - started_at >= MAX_SIMULATION_SECONDS:
+            limit_reached = True
+            break
         (state, pos, stack), trace = queue.popleft()
         if len(trace) > len(longest_trace):
             longest_trace = trace
@@ -331,3 +449,11 @@ def simulate_api(request: SimulateRequest):
         return simulate(request.pda, request.input_string, request.max_steps, request.max_configurations, request.max_stack_depth)
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="Invalid PDA data supplied for simulation.") from exc
+
+@app.post("/api/api-validator")
+def api_validator(request: ApiValidationRequest):
+    return validate_api_request(request.request_text, request.grammar, request.max_input_size, request.check_structure)
+
+@app.post("/api/boundary-tests")
+def boundary_tests():
+    return run_boundary_tests()

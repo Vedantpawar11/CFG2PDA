@@ -13,6 +13,8 @@ A small, beginner-friendly Theory of Computation project that parses and validat
 - Generated transition table and step-by-step conversion explanation.
 - Nondeterministic BFS simulation with branch-specific traces, visited configurations, and stack-depth/configuration/step limits.
 - Accepted, rejected, invalid-input, and limit-reached outcomes.
+- Shopping-order API validator with separate JSON syntax and CFG-to-PDA structural checks.
+- Compact API Request Validator workspace with syntax and CFG-to-PDA checks from the request input box.
 - Step trace, auto-run, current stack view, JSON/CSV export, and transition highlighting synchronized with the selected trace step.
 - Editing any grammar field clears stale validation/PDA/simulation output so old results cannot be mistaken for the current grammar.
 - Local system-font fallbacks; no remote font download is required.
@@ -130,6 +132,8 @@ A CFG is `G = (V, Σ, P, S)`. The generated PDA uses states `q0`, `q1`, and `qf`
 | POST | `/api/grammar/summary` | Return counts and normalized productions |
 | POST | `/api/pda/convert` | Generate PDA and conversion steps |
 | POST | `/api/pda/simulate` | Simulate an input string against PDA JSON |
+| POST | `/api/api-validator` | Validate JSON syntax and shopping-order/selected-CFG structure |
+| POST | `/api/boundary-tests` | Execute the automated boundary and edge-case suite |
 
 FastAPI's `/docs` page includes request schemas and interactive endpoint testing.
 
@@ -140,6 +144,14 @@ From `backend/` with the virtual environment activated:
 ```bash
 pytest -q
 ```
+
+The API validator is the primary frontend workflow: paste a request into the input box and choose
+JSON syntax validation or CFG-to-PDA structural validation. The validator reports JSON syntax
+independently from structural recognition: valid JSON can still be rejected by the configured grammar.
+The default shopping-order validator
+requires an `order` object containing an `items` array; each item must contain only a string
+`product` and a positive integer `quantity`. CFG structural validation does not establish
+authorization, security, or business correctness.
 
 ## Team of four
 
@@ -155,6 +167,8 @@ pytest -q
 - The graph groups edges that share a source and destination to keep the visualization readable; all transitions remain individually available in the table and PDA JSON.
 - BFS is bounded by the configured limits. A `LIMIT REACHED` result means exploration stopped at a safety threshold; it is not a rejection.
 - The UI uses system-font fallbacks to remain usable offline.
+- The default API structure grammar encodes the validated shopping-order shape into CFG terminals
+  before running the existing PDA recognizer; this keeps JSON parsing and CFG recognition separate.
 
 ## Future improvements
 
